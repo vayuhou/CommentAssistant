@@ -18,14 +18,21 @@ const mime = {
 const rateBuckets = new Map();
 const adminSessions = new Map();
 const pendingAi = new Map();
-let database = { codes:[] };
+let database = { codes:[], trials:{} };
 let writeQueue = Promise.resolve();
 
 async function loadDatabase() {
   await mkdir(dataDir, { recursive:true });
   try {
     const parsed = JSON.parse(await readFile(dbFile, 'utf8'));
-    if (Array.isArray(parsed.codes)) database = parsed;
+    if (Array.isArray(parsed.codes)) {
+      database = { codes:parsed.codes, trials:parsed.trials&&typeof parsed.trials==='object'?parsed.trials:{} };
+      for (const item of database.codes) {
+        item.devices = Array.isArray(item.devices) ? item.devices : item.deviceId ? [item.deviceId] : [];
+        item.maxDevices = Math.min(10, Math.max(1, Number(item.maxDevices)||2));
+        delete item.deviceId;
+      }
+    }
   } catch (error) {
     if (error?.code !== 'ENOENT') console.error('Activation database load failed:', error);
   }
@@ -71,6 +78,7 @@ function cookies(req) {
 
 function isSecureRequest(req) { return req.headers['x-forwarded-proto']==='https' || process.env.NODE_ENV==='production'; }
 function sessionCookie(req, token, maxAge=28800) { return `comment_admin=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isSecureRequest(req)?'; Secure':''}`; }
+function trialCookie(req, token) { return `comment_trial=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${isSecureRequest(req)?'; Secure':''}`; }
 
 function requireAdmin(req, res) {
   const token=cookies(req).comment_admin; const expiresAt=token&&adminSessions.get(token);
@@ -85,12 +93,12 @@ function newCode() {
 
 function publicCode(item) {
   const expired=Boolean(item.expiresAt && Date.parse(item.expiresAt)<=Date.now());
-  return { code:item.code, days:item.days, totalAiQuota:item.totalAiQuota, usedAiCount:item.usedAiCount, remainingAiCount:Math.max(0,item.totalAiQuota-item.usedAiCount), deviceId:item.deviceId, createdAt:item.createdAt, activatedAt:item.activatedAt, expiresAt:item.expiresAt, revoked:Boolean(item.revoked), status:item.revoked?'revoked':expired?'expired':item.deviceId?'active':'unused' };
+  return { code:item.code, days:item.days, totalAiQuota:item.totalAiQuota, usedAiCount:item.usedAiCount, remainingAiCount:Math.max(0,item.totalAiQuota-item.usedAiCount), deviceCount:item.devices.length, maxDevices:item.maxDevices, createdAt:item.createdAt, activatedAt:item.activatedAt, expiresAt:item.expiresAt, revoked:Boolean(item.revoked), status:item.revoked?'revoked':expired?'expired':item.devices.length?'active':'unused' };
 }
 
 function activationState(item, deviceId) {
-  const view=publicCode(item); const deviceMatches=Boolean(item.deviceId && item.deviceId===deviceId);
-  return { code:item.code, active:deviceMatches&&view.status==='active'&&view.remainingAiCount>0, expired:view.status==='expired', expiresAt:item.expiresAt||'', totalAiQuota:item.totalAiQuota, usedAiCount:item.usedAiCount, remainingAiCount:view.remainingAiCount, deviceId };
+  const view=publicCode(item); const deviceMatches=item.devices.includes(deviceId);
+  return { code:item.code, active:deviceMatches&&view.status==='active', expired:view.status==='expired', expiresAt:item.expiresAt||'', totalAiQuota:item.totalAiQuota, usedAiCount:item.usedAiCount, remainingAiCount:view.remainingAiCount, deviceId, trialRemaining:0 };
 }
 
 async function activateLicense(body) {
@@ -98,8 +106,10 @@ async function activateLicense(body) {
   if(!code||!deviceId)throw Object.assign(new Error('请输入激活码'),{status:400,code:'INVALID_LICENSE'});
   const item=database.codes.find(entry=>entry.code===code);
   if(!item||item.revoked)throw Object.assign(new Error('激活码不存在或已作废'),{status:404,code:'INVALID_LICENSE'});
-  if(item.deviceId&&item.deviceId!==deviceId)throw Object.assign(new Error('该激活码已绑定其他设备'),{status:409,code:'DEVICE_MISMATCH'});
-  if(!item.deviceId){item.deviceId=deviceId;item.activatedAt=new Date().toISOString();item.expiresAt=new Date(Date.now()+item.days*86400000).toISOString();await saveDatabase()}
+  if(!item.devices.includes(deviceId)){
+    if(item.devices.length>=item.maxDevices)throw Object.assign(new Error(`该激活码最多支持 ${item.maxDevices} 个浏览器，请先联系管理员解绑`),{status:409,code:'DEVICE_LIMIT_REACHED'});
+    item.devices.push(deviceId);if(!item.activatedAt){item.activatedAt=new Date().toISOString();item.expiresAt=new Date(Date.now()+item.days*86400000).toISOString()}await saveDatabase();
+  }
   const state=activationState(item,deviceId);
   if(state.expired)throw Object.assign(new Error('激活码已过期'),{status:403,code:'LICENSE_EXPIRED'});
   return state;
@@ -109,7 +119,7 @@ function reserveLicense(code, deviceId) {
   const item=database.codes.find(entry=>entry.code===String(code||'').toUpperCase());
   if(!item)throw Object.assign(new Error('请先使用有效激活码激活产品'),{status:403,code:'LICENSE_REQUIRED'});
   const state=activationState(item,String(deviceId||''));
-  if(item.deviceId!==deviceId)throw Object.assign(new Error('激活码与当前设备不匹配'),{status:403,code:'DEVICE_MISMATCH'});
+  if(!item.devices.includes(deviceId))throw Object.assign(new Error('激活码与当前设备不匹配'),{status:403,code:'DEVICE_MISMATCH'});
   if(state.expired||item.revoked)throw Object.assign(new Error('激活码已过期或作废'),{status:403,code:'LICENSE_EXPIRED'});
   const pending=pendingAi.get(item.code)||0;
   if(state.remainingAiCount-pending<=0)throw Object.assign(new Error('AI 次数已用完'),{status:403,code:'AI_QUOTA_EXHAUSTED'});
@@ -119,6 +129,22 @@ function reserveLicense(code, deviceId) {
 async function settleLicense(item, success) {
   pendingAi.set(item.code,Math.max(0,(pendingAi.get(item.code)||1)-1));
   if(success){item.usedAiCount=Math.min(item.totalAiQuota,item.usedAiCount+1);await saveDatabase()}
+}
+
+const TRIAL_GENERATION_LIMIT=3;
+function validLicenseForDevice(deviceId){return database.codes.some(item=>item.devices.includes(deviceId)&&!item.revoked&&(!item.expiresAt||Date.parse(item.expiresAt)>Date.now()))}
+function trialState(deviceId){const used=Math.max(0,Number(database.trials[deviceId])||0);return {used,remaining:Math.max(0,TRIAL_GENERATION_LIMIT-used),limit:TRIAL_GENERATION_LIMIT,licensed:validLicenseForDevice(deviceId)}}
+async function handleTrial(req,res,pathname){
+  try{
+    const body=await readJson(req);const existing=cookies(req).comment_trial;const deviceId=existing||randomBytes(24).toString('hex');const headers=existing?{}:{'Set-Cookie':trialCookie(req,deviceId)};
+    const state={...trialState(deviceId),licensed:validLicenseForDevice(String(body.deviceId||''))};
+    if(pathname==='/api/trial/status')return json(res,200,{success:true,data:{trial:state}},headers);
+    if(pathname==='/api/trial/consume'){
+      if(state.licensed)return json(res,200,{success:true,data:{trial:state}},headers);
+      if(state.remaining<=0)return json(res,403,{success:false,code:'TRIAL_EXHAUSTED',error:'3 次免费生成机会已用完，请输入激活码继续使用'},headers);
+      database.trials[deviceId]=state.used+1;await saveDatabase();return json(res,200,{success:true,data:{trial:trialState(deviceId)}},headers);
+    }
+  }catch(error){return json(res,400,{success:false,error:error.message||'试用状态检查失败'})}
 }
 
 async function handleAdmin(req, res, pathname) {
@@ -136,9 +162,13 @@ async function handleAdmin(req, res, pathname) {
   if(!requireAdmin(req,res))return;
   if(req.method==='GET'&&pathname==='/api/admin/codes')return json(res,200,{success:true,data:{codes:database.codes.map(publicCode).reverse()}});
   if(req.method==='POST'&&pathname==='/api/admin/codes'){
-    const body=await readJson(req); const count=Math.min(100,Math.max(1,Number(body.count)||1)); const days=Math.min(3650,Math.max(1,Number(body.days)||15)); const quota=Math.min(100000,Math.max(0,Number(body.quota)||200));
-    const created=Array.from({length:count},()=>({code:newCode(),days,totalAiQuota:quota,usedAiCount:0,deviceId:null,createdAt:new Date().toISOString(),activatedAt:null,expiresAt:null,revoked:false}));
+    const body=await readJson(req); const count=Math.min(100,Math.max(1,Number(body.count)||1)); const days=Math.min(3650,Math.max(1,Number(body.days)||15)); const quota=Math.min(100000,Math.max(0,Number(body.quota)||200));const maxDevices=Math.min(10,Math.max(1,Number(body.maxDevices)||2));
+    const created=Array.from({length:count},()=>({code:newCode(),days,totalAiQuota:quota,usedAiCount:0,devices:[],maxDevices,createdAt:new Date().toISOString(),activatedAt:null,expiresAt:null,revoked:false}));
     database.codes.push(...created);await saveDatabase();return json(res,201,{success:true,data:{codes:created.map(publicCode)}});
+  }
+  if(req.method==='POST'&&pathname.endsWith('/unbind')&&pathname.startsWith('/api/admin/codes/')){
+    const code=decodeURIComponent(pathname.slice('/api/admin/codes/'.length,-'/unbind'.length)).toUpperCase();const item=database.codes.find(entry=>entry.code===code);
+    if(!item)return json(res,404,{success:false,error:'激活码不存在'});item.devices=[];await saveDatabase();return json(res,200,{success:true,data:{code:publicCode(item)}});
   }
   if(req.method==='DELETE'&&pathname.startsWith('/api/admin/codes/')){
     const code=decodeURIComponent(pathname.slice('/api/admin/codes/'.length)).toUpperCase();const item=database.codes.find(entry=>entry.code===code);
@@ -186,6 +216,7 @@ http.createServer(async(req,res)=>{
     const url=new URL(req.url||'/','http://localhost');const pathname=decodeURIComponent(url.pathname);
     if(pathname.startsWith('/api/admin/'))return await handleAdmin(req,res,pathname);
     if(req.method==='POST'&&pathname.startsWith('/api/license/'))return await handleLicense(req,res,pathname);
+    if(req.method==='POST'&&pathname.startsWith('/api/trial/'))return await handleTrial(req,res,pathname);
     if(req.method==='POST'&&pathname==='/api/comment/ai-polish')return await handleAi(req,res,'polish');
     if(req.method==='POST'&&pathname==='/api/comment/ai-rewrite')return await handleAi(req,res,'rewrite');
     if(pathname==='/api/health')return json(res,200,{ok:true,aiConfigured:Boolean(process.env.AI_API_KEY),model:process.env.AI_MODEL||'deepseek-chat',fallbackModel:process.env.AI_FALLBACK_MODEL||null});

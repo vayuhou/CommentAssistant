@@ -8,7 +8,7 @@ const STORAGE_KEY = 'comment-assistant-project-v1';
 const deviceId = localStorage.getItem('comment-assistant-device') || createId();
 localStorage.setItem('comment-assistant-device', deviceId);
 
-const emptyActivation: ActivationState = { code:'', active:false, expired:false, expiresAt:'', totalAiQuota:0, usedAiCount:0, remainingAiCount:0, deviceId };
+const emptyActivation: ActivationState = { code:'', active:false, expired:false, expiresAt:'', totalAiQuota:0, usedAiCount:0, remainingAiCount:0, deviceId, trialRemaining:3 };
 const defaultLayout: PdfLayoutConfig = { preset: '4分', rows: 2, cols: 2, marginTop: 10, marginLeft: 10, gapX: 3, gapY: 3, showBackground: true, backgroundUrl: '/4/简约.png', zoom: .72 };
 const defaultElements: PdfElement[] = [
   { id: 'name', type: 'variable', field: 'studentName', name: '学生姓名', text: '{学生姓名}', x: 24, y: 22, w: 230, h: 34, fontSize: 18, fontWeight: 'bold', fontStyle: 'normal', underline: false, align: 'center', lineHeight: 1.4, color: '#1f2937' },
@@ -27,7 +27,7 @@ type Store = SavedState & {
   setActiveStudentId: (id: string) => void; setLayout: React.Dispatch<React.SetStateAction<PdfLayoutConfig>>; setElements: React.Dispatch<React.SetStateAction<PdfElement[]>>;
   updateStudent: (id: string, patch: Partial<Student>, historyType?: 'base'|'ai_polish'|'ai_rewrite'|'manual') => void;
   addStudent: (student: Student) => void; deleteStudents: (ids: string[]) => void; toggleTag: (id: string, category: TagKey, tag: string) => void;
-  generate: (ids: string[], target?: number) => {success:number;skipped:number}; runAi: (id: string, mode:'polish'|'rewrite', tone?:string,target?:number) => Promise<void>;
+  generate: (ids: string[], target?: number) => Promise<{success:number;skipped:number}>; runAi: (id: string, mode:'polish'|'rewrite', tone?:string,target?:number) => Promise<void>;
   activate: (code: string) => Promise<boolean>; restoreHistory: (id:string, content:string) => void; statusLabel: (s: Student) => string;
   toast: string; setToast: (value:string) => void;
   showStudentName: boolean; setShowStudentName: React.Dispatch<React.SetStateAction<boolean>>;
@@ -38,7 +38,7 @@ const AppContext = createContext<Store | null>(null);
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const saved = useMemo(() => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') as SavedState | null; } catch { return null; } }, []);
   const [students, setStudents] = useState<Student[]>(saved?.students?.length ? migrateStudents(saved.students) : initialStudents());
-  const [activation, setActivation] = useState<ActivationState>(saved?.activation?.code&&saved.activation.code!=='PY-DEMO-2026-LOCAL'?{...saved.activation,active:false,deviceId}:emptyActivation);
+  const [activation, setActivation] = useState<ActivationState>(saved?.activation?.code&&saved.activation.code!=='PY-DEMO-2026-LOCAL'?{...saved.activation,active:false,deviceId,trialRemaining:saved.activation.trialRemaining??3}:emptyActivation);
   const [layout, setLayout] = useState<PdfLayoutConfig>(migrateLayout(saved?.layout));
   const [elements, setElements] = useState(migrateElements(saved?.elements));
   const [showStudentName, setShowStudentName] = useState(saved?.showStudentName ?? true);
@@ -51,11 +51,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [students, activation, layout, elements, selectedIds, activeStudentId, showStudentName]);
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(''), 2600); return () => clearTimeout(t); }, [toast]);
   useEffect(() => {
-    if (!activation.code) return;
-    fetch('/api/license/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:activation.code,deviceId})})
-      .then(async response=>({ok:response.ok,result:await response.json().catch(()=>({}))}))
-      .then(({ok,result})=>setActivation(ok&&result.data?.activation?result.data.activation:emptyActivation))
-      .catch(()=>setActivation(current=>({...current,active:false})));
+    const refresh=async()=>{
+      if(activation.code){const response=await fetch('/api/license/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:activation.code,deviceId})});const result=await response.json().catch(()=>({}));if(response.ok&&result.data?.activation?.active){setActivation(result.data.activation);return}}
+      const response=await fetch('/api/trial/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({deviceId})});const result=await response.json().catch(()=>({}));setActivation({...emptyActivation,trialRemaining:result.data?.trial?.remaining??0});
+    };refresh().catch(()=>setActivation(current=>({...current,active:false})));
   }, []);
 
   const updateStudent: Store['updateStudent'] = (id, patch, historyType) => setStudents(prev => prev.map(s => {
@@ -66,7 +65,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const addStudent = (student: Student) => setStudents(prev => [...prev, { ...student, no: String(prev.length + 1).padStart(2, '0') }]);
   const deleteStudents = (ids: string[]) => setStudents(prev => prev.filter(s => !ids.includes(s.id)).map((s,i)=>({...s,no:String(i+1).padStart(2,'0')})));
   const toggleTag = (id: string, category: TagKey, tag: string) => setStudents(prev => prev.map(s => s.id !== id || s.locked ? s : ({ ...s, tags: { ...s.tags, [category]: s.tags[category].includes(tag) ? s.tags[category].filter(t=>t!==tag) : [...s.tags[category], tag] }, updatedAt: new Date().toISOString() })));
-  const generate: Store['generate'] = (ids, target = 150) => {
+  const generate: Store['generate'] = async (ids, target = 150) => {
+    const trialResponse=await fetch('/api/trial/consume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({deviceId})});const trialResult=await trialResponse.json().catch(()=>({}));
+    if(!trialResponse.ok){if(trialResult.code==='TRIAL_EXHAUSTED')setActivation(a=>({...a,active:false,trialRemaining:0}));throw new Error(trialResult.error||'生成权限检查失败')}
+    if(!activation.active)setActivation(a=>({...a,trialRemaining:trialResult.data?.trial?.remaining??a.trialRemaining}));
     let success = 0, skipped = 0;
     if (ids.length > 1) resetGenerationMemory();
     setStudents(prev => prev.map(s => {

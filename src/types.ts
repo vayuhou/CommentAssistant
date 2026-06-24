@@ -37,6 +37,7 @@ export type ActivationState = {
   usedAiCount: number;
   remainingAiCount: number;
   deviceId: string;
+  trialRemaining: number;
 };
 
 export type PdfElement = {
