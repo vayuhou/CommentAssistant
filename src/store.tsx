@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { initialStudents, STATUS_LABELS } from './data';
-import { demoAiTransform, generateComment, generateMotto, resetGenerationMemory } from './rules';
+import { generateComment, generateMotto, resetGenerationMemory } from './rules';
 import type { ActivationState, PdfElement, PdfLayoutConfig, Student, TagKey } from './types';
 import { createId } from './id';
 
@@ -8,10 +8,7 @@ const STORAGE_KEY = 'comment-assistant-project-v1';
 const deviceId = localStorage.getItem('comment-assistant-device') || createId();
 localStorage.setItem('comment-assistant-device', deviceId);
 
-const demoActivation: ActivationState = {
-  code: 'PY-DEMO-2026-LOCAL', active: true, expired: false,
-  expiresAt: new Date(Date.now() + 15 * 86400000).toISOString(), totalAiQuota: 200, usedAiCount: 0, remainingAiCount: 200, deviceId,
-};
+const emptyActivation: ActivationState = { code:'', active:false, expired:false, expiresAt:'', totalAiQuota:0, usedAiCount:0, remainingAiCount:0, deviceId };
 const defaultLayout: PdfLayoutConfig = { preset: '4分', rows: 2, cols: 2, marginTop: 10, marginLeft: 10, gapX: 3, gapY: 3, showBackground: true, backgroundUrl: '/4/简约.png', zoom: .72 };
 const defaultElements: PdfElement[] = [
   { id: 'name', type: 'variable', field: 'studentName', name: '学生姓名', text: '{学生姓名}', x: 24, y: 22, w: 230, h: 34, fontSize: 18, fontWeight: 'bold', fontStyle: 'normal', underline: false, align: 'center', lineHeight: 1.4, color: '#1f2937' },
@@ -31,7 +28,7 @@ type Store = SavedState & {
   updateStudent: (id: string, patch: Partial<Student>, historyType?: 'base'|'ai_polish'|'ai_rewrite'|'manual') => void;
   addStudent: (student: Student) => void; deleteStudents: (ids: string[]) => void; toggleTag: (id: string, category: TagKey, tag: string) => void;
   generate: (ids: string[], target?: number) => {success:number;skipped:number}; runAi: (id: string, mode:'polish'|'rewrite', tone?:string,target?:number) => Promise<void>;
-  activate: (code: string) => boolean; restoreHistory: (id:string, content:string) => void; statusLabel: (s: Student) => string;
+  activate: (code: string) => Promise<boolean>; restoreHistory: (id:string, content:string) => void; statusLabel: (s: Student) => string;
   toast: string; setToast: (value:string) => void;
   showStudentName: boolean; setShowStudentName: React.Dispatch<React.SetStateAction<boolean>>;
 };
@@ -41,7 +38,7 @@ const AppContext = createContext<Store | null>(null);
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const saved = useMemo(() => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') as SavedState | null; } catch { return null; } }, []);
   const [students, setStudents] = useState<Student[]>(saved?.students?.length ? migrateStudents(saved.students) : initialStudents());
-  const [activation, setActivation] = useState(saved?.activation || demoActivation);
+  const [activation, setActivation] = useState<ActivationState>(saved?.activation?.code&&saved.activation.code!=='PY-DEMO-2026-LOCAL'?{...saved.activation,active:false,deviceId}:emptyActivation);
   const [layout, setLayout] = useState<PdfLayoutConfig>(migrateLayout(saved?.layout));
   const [elements, setElements] = useState(migrateElements(saved?.elements));
   const [showStudentName, setShowStudentName] = useState(saved?.showStudentName ?? true);
@@ -53,6 +50,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ students, activation, layout, elements, selectedIds, activeStudentId, showStudentName }));
   }, [students, activation, layout, elements, selectedIds, activeStudentId, showStudentName]);
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(''), 2600); return () => clearTimeout(t); }, [toast]);
+  useEffect(() => {
+    if (!activation.code) return;
+    fetch('/api/license/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:activation.code,deviceId})})
+      .then(async response=>({ok:response.ok,result:await response.json().catch(()=>({}))}))
+      .then(({ok,result})=>setActivation(ok&&result.data?.activation?result.data.activation:emptyActivation))
+      .catch(()=>setActivation(current=>({...current,active:false})));
+  }, []);
 
   const updateStudent: Store['updateStudent'] = (id, patch, historyType) => setStudents(prev => prev.map(s => {
     if (s.id !== id) return s;
@@ -77,18 +81,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!student || student.locked) throw new Error('该学生已锁定或不存在');
     if (!activation.active || activation.expired || activation.remainingAiCount <= 0) throw new Error('激活状态无效或 AI 次数不足');
     let comment = '';
-    const response = await fetch(`/api/comment/ai-${mode}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ student, baseComment:student.comment, tone, targetLength:target, showStudentName }) });
+    const response = await fetch(`/api/comment/ai-${mode}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ student, baseComment:student.comment, tone, targetLength:target, showStudentName, licenseCode:activation.code, deviceId }) });
     const result = await response.json().catch(()=>({}));
-    if (response.ok) comment = result.data?.comment || '';
-    else if (result.code === 'AI_NOT_CONFIGURED') { await new Promise(r=>setTimeout(r,350)); comment = demoAiTransform(student, mode, tone, target, showStudentName); }
-    else throw new Error(result.error || 'AI 服务请求失败');
+    if (response.ok) { comment = result.data?.comment || ''; if(result.data?.activation)setActivation(result.data.activation); }
+    else { if(['LICENSE_REQUIRED','DEVICE_MISMATCH','LICENSE_EXPIRED','AI_QUOTA_EXHAUSTED'].includes(result.code))setActivation(a=>({...a,active:false,remainingAiCount:result.code==='AI_QUOTA_EXHAUSTED'?0:a.remainingAiCount})); throw new Error(result.error || 'AI 服务请求失败'); }
     if (!comment) throw new Error('AI 返回内容为空');
     updateStudent(id, { motto:generateMotto(student), comment, aiComment: comment, status: mode==='polish'?'ai_polished':'ai_rewritten' }, mode==='polish'?'ai_polish':'ai_rewrite');
-    setActivation(a=>({...a, usedAiCount:a.usedAiCount+1, remainingAiCount:a.remainingAiCount-1}));
   };
-  const activate = (code: string) => {
-    const known = code === 'PY-DEMO-2026-LOCAL' || (JSON.parse(localStorage.getItem('comment-assistant-codes') || '[]') as string[]).includes(code);
-    if (known) setActivation({ ...demoActivation, code, deviceId }); return known;
+  const activate = async (code: string) => {
+    const response=await fetch('/api/license/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,deviceId})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(result.error||'激活失败');
+    if(!result.data?.activation)return false;setActivation(result.data.activation);return true;
   };
   const restoreHistory = (id:string, content:string) => updateStudent(id,{comment:content,status:'edited'},'manual');
   const value: Store = { students,setStudents,activation,layout,setLayout,elements,setElements,selectedIds,setSelectedIds,activeStudentId,setActiveStudentId,updateStudent,addStudent,deleteStudents,toggleTag,generate,runAi,activate,restoreHistory,statusLabel:s=>s.locked?'已锁定':STATUS_LABELS[s.status],toast,setToast,showStudentName,setShowStudentName };
