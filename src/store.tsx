@@ -2,9 +2,10 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 import { initialStudents, STATUS_LABELS } from './data';
 import { demoAiTransform, generateComment, generateMotto, resetGenerationMemory } from './rules';
 import type { ActivationState, PdfElement, PdfLayoutConfig, Student, TagKey } from './types';
+import { createId } from './id';
 
 const STORAGE_KEY = 'comment-assistant-project-v1';
-const deviceId = localStorage.getItem('comment-assistant-device') || crypto.randomUUID();
+const deviceId = localStorage.getItem('comment-assistant-device') || createId();
 localStorage.setItem('comment-assistant-device', deviceId);
 
 const demoActivation: ActivationState = {
@@ -55,7 +56,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const updateStudent: Store['updateStudent'] = (id, patch, historyType) => setStudents(prev => prev.map(s => {
     if (s.id !== id) return s;
-    const history = historyType && patch.comment !== undefined ? [...s.history, { id: crypto.randomUUID(), type: historyType, content: patch.comment, createdAt: new Date().toISOString() }] : s.history;
+    const history = historyType && patch.comment !== undefined ? [...s.history, { id: createId(), type: historyType, content: patch.comment, createdAt: new Date().toISOString() }] : s.history;
     return { ...s, ...patch, history, updatedAt: new Date().toISOString() };
   }));
   const addStudent = (student: Student) => setStudents(prev => [...prev, { ...student, no: String(prev.length + 1).padStart(2, '0') }]);
@@ -67,7 +68,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setStudents(prev => prev.map(s => {
       if (!ids.includes(s.id)) return s; if (s.locked) { skipped++; return s; }
       const comment = generateComment(s, target, showStudentName); success++;
-      return { ...s, motto:generateMotto(s), comment, baseComment: comment, status: 'base_generated', history: [...s.history, { id: crypto.randomUUID(), type: 'base', content: comment, createdAt: new Date().toISOString() }], updatedAt: new Date().toISOString() };
+      return { ...s, motto:generateMotto(s), comment, baseComment: comment, status: 'base_generated', history: [...s.history, { id: createId(), type: 'base', content: comment, createdAt: new Date().toISOString() }], updatedAt: new Date().toISOString() };
     }));
     return { success, skipped };
   };

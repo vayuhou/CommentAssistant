@@ -1,4 +1,5 @@
 import type { Student, TagKey } from './types';
+import { createId } from './id';
 
 export const TAG_CATEGORIES: Record<TagKey, { title: string; tags: string[] }> = {
   learning: { title: '学习表现', tags: ['学习之星', '勤奋努力', '思维活跃', '热爱阅读', '书写工整', '计算能手', '战胜粗心', '基础薄弱', '作业拖拉', '字迹潦草'] },
@@ -18,7 +19,7 @@ const now = () => new Date().toISOString();
 export function createStudent(name: string, index: number, partial: Partial<Student> = {}): Student {
   const created = now();
   return {
-    id: crypto.randomUUID(), no: String(index + 1).padStart(2, '0'), name, gender: '未知', type: '未分类', note: '',
+    id: createId(), no: String(index + 1).padStart(2, '0'), name, gender: '未知', type: '未分类', note: '',
     tags: { learning: [], personality: [], behavior: [], specialty: [], improvement: [], suggestion: [] },
     comment: '', status: 'empty', locked: false, history: [], createdAt: created, updatedAt: created, ...partial,
   };
