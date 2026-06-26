@@ -16,7 +16,7 @@ export default function MainView({navigate}:{navigate:(page:string)=>void}) {
   const filtered=useMemo(()=>students.filter(s=>s.name.includes(search)&&(type==='全部类型'||s.type===type)&&(status==='全部状态'||(status==='未生成'&&!s.comment)||(status==='已生成'&&!!s.comment)||(status==='AI润色'&&s.status==='ai_polished')||(status==='已锁定'&&s.locked))),[students,search,status,type]);
   const selected=students.filter(s=>selectedIds.includes(s.id));
   const act=async(id:string,action:string)=>{const s=students.find(x=>x.id===id);if(!s)return;try{
-    if(action==='generate'){await generate([id]);setToast('已生成基础评语');}
+    if(action==='generate'){await generate([id]);setToast('已生成评语');}
     if(action==='polish'||action==='rewrite'){setLoading(`${id}-${action}`);await runAi(id,action as 'polish'|'rewrite');setToast(action==='polish'?'AI 润色完成':'AI 重写完成');}
     if(action==='copy'){await navigator.clipboard.writeText(s.comment);setToast('评语已复制');}
     if(action==='lock')updateStudent(id,{locked:!s.locked,status:!s.locked?'locked':s.comment?'edited':'empty'});
